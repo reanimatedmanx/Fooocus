@@ -87,7 +87,13 @@ def get_torch_device():
         if is_intel_xpu():
             return torch.device("xpu")
         else:
-            return torch.device(torch.cuda.current_device())
+            # Check if CUDA is available before using it
+            if torch.cuda.is_available():
+                return torch.device(torch.cuda.current_device())
+            else:
+                # No GPU available, fall back to CPU
+                print("Warning: No GPU detected (NVIDIA/AMD/Intel). Falling back to CPU.")
+                return torch.device("cpu")
 
 def get_total_memory(dev=None, torch_total_too=False):
     global directml_enabled
@@ -106,12 +112,16 @@ def get_total_memory(dev=None, torch_total_too=False):
             mem_reserved = stats['reserved_bytes.all.current']
             mem_total = torch.xpu.get_device_properties(dev).total_memory
             mem_total_torch = mem_reserved
-        else:
+        elif torch.cuda.is_available() and hasattr(dev, 'type') and dev.type == 'cuda':
             stats = torch.cuda.memory_stats(dev)
             mem_reserved = stats['reserved_bytes.all.current']
             _, mem_total_cuda = torch.cuda.mem_get_info(dev)
             mem_total_torch = mem_reserved
             mem_total = mem_total_cuda
+        else:
+            # Fallback to CPU memory if no GPU available
+            mem_total = psutil.virtual_memory().total
+            mem_total_torch = mem_total
 
     if torch_total_too:
         return (mem_total, mem_total_torch)
@@ -174,12 +184,13 @@ VAE_DTYPE = torch.float32
 
 try:
     if is_nvidia():
-        torch_version = torch.version.__version__
-        if int(torch_version[0]) >= 2:
-            if ENABLE_PYTORCH_ATTENTION == False and args.attention_split == False and args.attention_quad == False:
-                ENABLE_PYTORCH_ATTENTION = True
-            if torch.cuda.is_bf16_supported() and torch.cuda.get_device_properties(torch.cuda.current_device()).major >= 8:
-                VAE_DTYPE = torch.bfloat16
+        if torch.cuda.is_available():
+            torch_version = torch.version.__version__
+            if int(torch_version[0]) >= 2:
+                if ENABLE_PYTORCH_ATTENTION == False and args.attention_split == False and args.attention_quad == False:
+                    ENABLE_PYTORCH_ATTENTION = True
+                if torch.cuda.is_bf16_supported() and torch.cuda.get_device_properties(torch.cuda.current_device()).major >= 8:
+                    VAE_DTYPE = torch.bfloat16
     if is_intel_xpu():
         if args.attention_split == False and args.attention_quad == False:
             ENABLE_PYTORCH_ATTENTION = True
@@ -245,16 +256,32 @@ def get_torch_device_name(device):
     if hasattr(device, 'type'):
         if device.type == "cuda":
             try:
-                allocator_backend = torch.cuda.get_allocator_backend()
+                if torch.cuda.is_available():
+                    allocator_backend = torch.cuda.get_allocator_backend()
+                else:
+                    allocator_backend = ""
             except:
                 allocator_backend = ""
-            return "{} {} : {}".format(device, torch.cuda.get_device_name(device), allocator_backend)
+            try:
+                if torch.cuda.is_available():
+                    device_name = torch.cuda.get_device_name(device)
+                else:
+                    device_name = "CUDA (unavailable)"
+            except:
+                device_name = "CUDA (unknown)"
+            return "{} {} : {}".format(device, device_name, allocator_backend)
         else:
             return "{}".format(device.type)
     elif is_intel_xpu():
         return "{} {}".format(device, torch.xpu.get_device_name(device))
     else:
-        return "CUDA {}: {}".format(device, torch.cuda.get_device_name(device))
+        if torch.cuda.is_available():
+            try:
+                return "CUDA {}: {}".format(device, torch.cuda.get_device_name(device))
+            except:
+                return "CUDA {}: {}".format(device, "unknown")
+        else:
+            return "CPU"
 
 try:
     print("Device:", get_torch_device_name(get_torch_device()))
@@ -668,13 +695,17 @@ def get_free_memory(dev=None, torch_free_too=False):
             mem_reserved = stats['reserved_bytes.all.current']
             mem_free_torch = mem_reserved - mem_active
             mem_free_total = torch.xpu.get_device_properties(dev).total_memory - mem_allocated
-        else:
+        elif torch.cuda.is_available() and hasattr(dev, 'type') and dev.type == 'cuda':
             stats = torch.cuda.memory_stats(dev)
             mem_active = stats['active_bytes.all.current']
             mem_reserved = stats['reserved_bytes.all.current']
             mem_free_cuda, _ = torch.cuda.mem_get_info(dev)
             mem_free_torch = mem_reserved - mem_active
             mem_free_total = mem_free_cuda + mem_free_torch
+        else:
+            # Fallback to CPU memory if no GPU available
+            mem_free_total = psutil.virtual_memory().available
+            mem_free_torch = mem_free_total
 
     if torch_free_too:
         return (mem_free_total, mem_free_torch)
@@ -727,11 +758,17 @@ def should_use_fp16(device=None, model_params=0, prioritize_performance=True):
     if is_intel_xpu():
         return True
 
+    if not torch.cuda.is_available():
+        return False
+
     if torch.cuda.is_bf16_supported():
         return True
 
-    props = torch.cuda.get_device_properties("cuda")
-    if props.major < 6:
+    try:
+        props = torch.cuda.get_device_properties("cuda")
+        if props.major < 6:
+            return False
+    except:
         return False
 
     fp16_works = False
@@ -767,8 +804,11 @@ def soft_empty_cache(force=False):
         torch.xpu.empty_cache()
     elif torch.cuda.is_available():
         if force or is_nvidia(): #This seems to make things worse on ROCm so I only do it for cuda
-            torch.cuda.empty_cache()
-            torch.cuda.ipc_collect()
+            try:
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
+            except:
+                pass
 
 def unload_all_models():
     free_memory(1e30, get_torch_device())
